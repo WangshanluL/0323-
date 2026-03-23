@@ -1,0 +1,18 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(head:*)",
+      "Bash(python -c \"import ast; ast.parse\\(open\\(''style/user_alignment.py''\\).read\\(\\)\\); print\\(''style OK''\\)\")",
+      "Bash(python -c \"import ast; ast.parse\\(open\\(''topic/topic_theme_match.py''\\).read\\(\\)\\); print\\(''topic OK''\\)\")",
+      "Bash(python -c \"import ast; ast.parse\\(open\\(''ensemble.py''\\).read\\(\\)\\); print\\(''ensemble OK''\\)\")",
+      "Bash(python -c \"import ast; ast.parse\\(open\\(''style/user_alignment.py'', encoding=''utf-8''\\).read\\(\\)\\); print\\(''style OK''\\)\")",
+      "Bash(python -c \"import ast; ast.parse\\(open\\(''topic/topic_theme_match.py'', encoding=''utf-8''\\).read\\(\\)\\); print\\(''topic OK''\\)\")",
+      "Bash(python -c \"import ast; ast.parse\\(open\\(''ensemble.py'', encoding=''utf-8''\\).read\\(\\)\\); print\\(''ensemble OK''\\)\")",
+      "Bash(python -c \":*)",
+      "Bash(python -c \"import ast; ast.parse\\(open\\(''align_ensemble.py'', encoding=''utf-8''\\).read\\(\\)\\); print\\(''syntax OK''\\)\")",
+      "Bash(python align_ensemble.py --source_file data/source_alignment_ground_truth.csv --target_file data/target_alignment_ground_truth.csv --need_align_file data/source_need_align_accounts.csv --ground_truth_file data/ground_truth_mapping.csv --output_file data/ensemble_out.csv --k 10 --disable_topic)",
+      "Bash(python -c \"import pandas as pd; df = pd.read_csv\\(''data/ensemble_out.csv''\\); print\\(df.shape\\); print\\(df.head\\(3\\).to_string\\(\\)\\)\")",
+      "Bash(ls \"C:\\\\Users\\\\admin\\\\Desktop\\\\0323-\"/*.md)"
+    ]
+  }
+}

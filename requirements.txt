@@ -1,0 +1,21 @@
+# 核心数值计算
+numpy>=1.24
+pandas>=2.0
+scipy>=1.10
+
+# 机器学习（GNN / Style 方法依赖）
+scikit-learn>=1.3
+
+# 进度条
+tqdm>=4.64
+
+# Topic 方法依赖（需要 GPU 环境时额外安装带 CUDA 的 torch）
+# CPU 版：pip install torch --index-url https://download.pytorch.org/whl/cpu
+# GPU 版（如 CUDA 12.4）：pip install torch --index-url https://download.pytorch.org/whl/cu124
+torch>=2.0
+
+# Sentence Transformer（Topic 方法，默认模型 BAAI/bge-m3 约 570MB）
+sentence-transformers>=2.2
+
+# HuggingFace Hub（下载模型，sentence-transformers 依赖）
+huggingface-hub>=0.14

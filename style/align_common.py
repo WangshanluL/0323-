@@ -190,11 +190,12 @@ def compute_alignment_metrics(
                 hitk += 1.0
             mrr_sum += 1.0 / rank
     if cnt == 0:
-        return {"hit@1": 0.0, f"hit@{k}": 0.0, "MRR": 0.0}
+        return {"hit@1": 0.0, f"hit@{k}": 0.0, "MRR": 0.0, "evaluated_users": 0}
     return {
         "hit@1": hit1 / cnt,
         f"hit@{k}": hitk / cnt,
         "MRR": mrr_sum / cnt,
+        "evaluated_users": cnt,
     }
 
 

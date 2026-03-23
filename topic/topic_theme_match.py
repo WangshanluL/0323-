@@ -1,6 +1,6 @@
 import argparse
 import os
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 
@@ -425,6 +425,238 @@ def _best_match_score(
         w = w / np.clip(np.sum(w), 1e-12, None)
         return float(np.sum(w * sims))
     raise ValueError(f"Unsupported agg_mode={agg_mode}")
+
+
+def run_alignment(
+    source_file: str,
+    target_file: str,
+    need_align_file: str,
+    output_file: str,
+    K: int = 10,
+    ground_truth_file: Optional[str] = None,
+    *,
+    model_name: str = "BAAI/bge-m3",
+    device: str = "auto",
+    batch_size: int = 32,
+    max_length: int = 256,
+    num_topics: int = 80,
+    cluster_backend: str = "kmeans",
+    cluster_random_state: int = 42,
+    kmeans_n_init: int = 10,
+    minibatch_batch_size: int = 4096,
+    topic_fit_scope: str = "both",
+    assignment_mode: str = "hard",
+    softmax_temperature: float = 0.07,
+    time_window_days: int = 2,
+    window_direction: str = "forward",
+    day_match_agg: str = "max",
+    day_match_topk: int = 3,
+    day_match_temperature: float = 0.07,
+    topic_weight: float = 0.7,
+    embed_weight: float = 0.3,
+    global_weight: float = 0.1,
+    tz_offset_hours: int = 0,
+) -> Tuple[str, Dict]:
+    """
+    主题维度用户对齐，接口与 GNN run_alignment 统一。
+
+    Parameters
+    ----------
+    source_file       : 源平台消息 CSV 路径
+    target_file       : 目标平台消息 CSV 路径
+    need_align_file   : 待对齐 source 账号列表 CSV（含 account_id 列）
+    output_file       : 结果输出 CSV 路径
+    K                 : Top-K 候选数量
+    ground_truth_file : 真值表 CSV 路径（可选）
+
+    Returns
+    -------
+    (output_file_path, metrics)
+      metrics 含 hit@1, hit@{K}, MRR, evaluated_users；若无真值则为 {}
+    """
+    source_need_accounts = _load_need_align_accounts(need_align_file)
+
+    src_df = pd.read_csv(source_file)
+    tgt_df = pd.read_csv(target_file)
+
+    target_need_accounts = tgt_df["account_id"].astype(str).unique().tolist()
+
+    src_df = src_df[src_df["account_id"].astype(str).isin(source_need_accounts)]
+
+    src_text = src_df[src_df["type"] == "text"].copy()
+    tgt_text = tgt_df[tgt_df["type"] == "text"].copy()
+
+    if len(src_text) == 0 or len(tgt_text) == 0:
+        raise ValueError("No text samples found in source/target after filtering.")
+
+    src_text["day_id"] = _unix_day_id(src_text["time"].values, tz_offset_hours)
+    tgt_text["day_id"] = _unix_day_id(tgt_text["time"].values, tz_offset_hours)
+    src_text["msg"] = src_text["msg"].astype(str)
+    tgt_text["msg"] = tgt_text["msg"].astype(str)
+
+    print(f"[topic] Embedding source ({len(src_text)} rows) and target ({len(tgt_text)} rows)...")
+    src_emb = embed_texts(model_name, src_text["msg"].tolist(), batch_size, max_length, device=device)
+    tgt_emb = embed_texts(model_name, tgt_text["msg"].tolist(), batch_size, max_length, device=device)
+
+    src_emb = _l2_normalize(src_emb)
+    tgt_emb = _l2_normalize(tgt_emb)
+
+    src_day_emb = build_user_day_embed_avg(src_text, src_emb)
+    tgt_day_emb = build_user_day_embed_avg(tgt_text, tgt_emb)
+    src_global_emb = build_user_global_embed_avg(src_text, src_emb)
+    tgt_global_emb = build_user_global_embed_avg(tgt_text, tgt_emb)
+
+    X_fit = src_emb if topic_fit_scope == "source_only" else np.vstack([src_emb, tgt_emb])
+    effective_num_topics = min(int(num_topics), X_fit.shape[0])
+    if effective_num_topics < 2:
+        raise ValueError("num_topics too small compared to available text samples.")
+
+    print(f"[topic] Clustering: backend={cluster_backend}, num_topics={effective_num_topics}")
+    kmeans = _fit_topic_cluster_model(
+        X_fit,
+        effective_num_topics,
+        cluster_backend=cluster_backend,
+        random_state=cluster_random_state,
+        kmeans_n_init=kmeans_n_init,
+        minibatch_batch_size=minibatch_batch_size,
+    )
+
+    if assignment_mode == "hard":
+        src_labels = kmeans.predict(src_emb)
+        tgt_labels = kmeans.predict(tgt_emb)
+        src_themes = build_user_day_topic_hist(src_text, src_labels, effective_num_topics)
+        tgt_themes = build_user_day_topic_hist(tgt_text, tgt_labels, effective_num_topics)
+    else:
+        centers = _l2_normalize(kmeans.cluster_centers_.astype(np.float32))
+        src_probs = _softmax(src_emb @ centers.T, temperature=softmax_temperature)
+        tgt_probs = _softmax(tgt_emb @ centers.T, temperature=softmax_temperature)
+        src_themes = build_user_day_topic_hist_soft(src_text, src_probs, effective_num_topics)
+        tgt_themes = build_user_day_topic_hist_soft(tgt_text, tgt_probs, effective_num_topics)
+
+    embed_dim = src_emb.shape[1]
+
+    def _pack(themes_by_acc, day_emb_by_acc, acc_id):
+        topic_items = themes_by_acc.get(acc_id, [])
+        embed_items = day_emb_by_acc.get(acc_id, [])
+        day_to_topic = {int(d): v for d, v in topic_items}
+        day_to_embed = {int(d): v for d, v in embed_items}
+        all_days = sorted(set(day_to_topic.keys()) | set(day_to_embed.keys()))
+        if not all_days:
+            return (
+                np.zeros((0,), dtype=np.int64),
+                np.zeros((0, effective_num_topics), dtype=np.float32),
+                np.zeros((0, embed_dim), dtype=np.float32),
+            )
+        days_arr = np.asarray(all_days, dtype=np.int64)
+        topic_vecs = np.stack(
+            [day_to_topic.get(int(d), np.zeros(effective_num_topics, dtype=np.float32)) for d in all_days]
+        ).astype(np.float32)
+        embed_vecs = np.stack(
+            [day_to_embed.get(int(d), np.zeros(embed_dim, dtype=np.float32)) for d in all_days]
+        ).astype(np.float32)
+        return days_arr, topic_vecs, embed_vecs
+
+    def _score_days(src_days, src_vecs, tgt_days, tgt_vecs):
+        total = 0.0
+        valid = 0
+        for i in range(src_vecs.shape[0]):
+            day_s = src_days[i]
+            if window_direction == "forward":
+                mask = (tgt_days >= day_s) & (tgt_days <= (day_s + time_window_days))
+            else:
+                mask = (tgt_days >= (day_s - time_window_days)) & (tgt_days <= (day_s + time_window_days))
+            if not np.any(mask):
+                continue
+            sims = tgt_vecs[mask] @ src_vecs[i]
+            total += _best_match_score(sims, day_match_agg, day_match_topk, day_match_temperature)
+            valid += 1
+        return total / valid if valid > 0 else 0.0
+
+    src_packed = {acc: _pack(src_themes, src_day_emb, acc) for acc in source_need_accounts}
+    tgt_packed = {acc: _pack(tgt_themes, tgt_day_emb, acc) for acc in target_need_accounts}
+
+    # 加载真值表（可选）
+    gt_map: Dict[str, str] = {}
+    if ground_truth_file and os.path.isfile(ground_truth_file):
+        gt_df_raw = pd.read_csv(ground_truth_file)
+        cols_lower = {c.strip().lower(): c for c in gt_df_raw.columns}
+        src_col = next(
+            (cols_lower[k] for k in ("source_account_id", "source_account", "source") if k in cols_lower),
+            gt_df_raw.columns[0],
+        )
+        tgt_col = next(
+            (cols_lower[k] for k in ("target_account_id", "target_account", "target") if k in cols_lower),
+            gt_df_raw.columns[1],
+        )
+        gt_map = {str(r[src_col]): str(r[tgt_col]) for _, r in gt_df_raw.iterrows()}
+
+    tw, ew, gw = topic_weight, embed_weight, global_weight
+
+    print("[topic] Scoring source accounts vs all target accounts...")
+    prediction_rows = []
+    hit1_sum = 0
+    hitK_sum = 0
+    mrr_sum = 0.0
+    eval_cnt = 0
+
+    for src_acc in source_need_accounts:
+        src_days, src_topic_vecs, src_embed_vecs = src_packed[src_acc]
+        scores = []
+        for tgt_acc in target_need_accounts:
+            tgt_days, tgt_topic_vecs, tgt_embed_vecs = tgt_packed[tgt_acc]
+            topic_score = (
+                _score_days(src_days, src_topic_vecs, tgt_days, tgt_topic_vecs)
+                if src_topic_vecs.shape[0] > 0 and tgt_topic_vecs.shape[0] > 0
+                else 0.0
+            )
+            embed_score = (
+                _score_days(src_days, src_embed_vecs, tgt_days, tgt_embed_vecs)
+                if src_embed_vecs.shape[0] > 0 and tgt_embed_vecs.shape[0] > 0
+                else 0.0
+            )
+            global_score = 0.0
+            if abs(gw) > 1e-15:
+                src_g = src_global_emb.get(src_acc)
+                tgt_g = tgt_global_emb.get(tgt_acc)
+                if src_g is not None and tgt_g is not None:
+                    global_score = float(tgt_g @ src_g)
+            scores.append(tw * topic_score + ew * embed_score + gw * global_score)
+
+        scores_arr = np.asarray(scores, dtype=np.float32)
+        order = np.argsort(-scores_arr, kind="stable")
+        ranked_targets = [target_need_accounts[i] for i in order]
+        top_targets = ranked_targets[:K]
+        prediction_rows.append({
+            "source_account_id": src_acc,
+            "predict_target_account_id": ",".join(top_targets),
+        })
+
+        if src_acc in gt_map:
+            h1, hk, mrr_val = compute_metrics(ranked_targets, gt_map[src_acc], K)
+            hit1_sum += h1
+            hitK_sum += hk
+            mrr_sum += mrr_val
+            eval_cnt += 1
+
+    pred_df = pd.DataFrame(prediction_rows)
+    os.makedirs(os.path.dirname(os.path.abspath(output_file)), exist_ok=True)
+    pred_df.to_csv(output_file, index=False, encoding="utf-8-sig")
+    print(f"[topic] 已写入: {output_file} ({len(pred_df)} 行)")
+
+    metrics: Dict = {}
+    if eval_cnt > 0:
+        metrics = {
+            "hit@1": hit1_sum / eval_cnt,
+            f"hit@{K}": hitK_sum / eval_cnt,
+            "MRR": mrr_sum / eval_cnt,
+            "evaluated_users": eval_cnt,
+        }
+        print(
+            f"[topic] 评估结果: hit@1={metrics['hit@1']:.4f}, "
+            f"hit@{K}={metrics[f'hit@{K}']:.4f}, MRR={metrics['MRR']:.4f}"
+        )
+
+    return output_file, metrics
 
 
 def main():

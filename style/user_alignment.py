@@ -14,9 +14,10 @@
 from __future__ import annotations
 
 import argparse
+import ast
 import os
 import sys
-from typing import Dict
+from typing import Dict, List, Optional
 
 # 先于本地模块 import，保证从任意工作目录运行可找到 align_*.py
 _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -341,6 +342,114 @@ def run_both_and_evaluate(
                 )
                 write_alignment_csv_two_columns(cand_fused, fused_csv)
                 print(f"已写入（融合）: {fused_csv}")
+
+
+def _load_need_align_accounts(need_align_file: str) -> List[str]:
+    """从 need_align_file CSV 读取待对齐的 source account_id 列表。"""
+    df = pd.read_csv(need_align_file)
+    if "account_id" not in df.columns:
+        raise ValueError(f"Expected column `account_id` in {need_align_file}, got {df.columns.tolist()}")
+    return df["account_id"].astype(str).tolist()
+
+
+def _borda_fuse_candidates(
+    cand_a: pd.DataFrame,
+    cand_b: pd.DataFrame,
+    K: int,
+) -> pd.DataFrame:
+    """
+    Borda count 融合两个候选表。
+    排名第 i（1-indexed）得分 = K - i + 1；超出 K 则得 0。
+    """
+    def _to_dict(df: pd.DataFrame) -> dict[str, list]:
+        result = {}
+        for _, row in df.iterrows():
+            preds = row["predict_target_account_id"]
+            if isinstance(preds, str):
+                try:
+                    preds = ast.literal_eval(preds)
+                except Exception:
+                    preds = [p.strip() for p in preds.replace(";", ",").split(",") if p.strip()]
+            result[str(row["source_account_id"])] = [str(p) for p in (preds or [])]
+        return result
+
+    idx_a = _to_dict(cand_a)
+    idx_b = _to_dict(cand_b)
+    all_sources = sorted(set(idx_a.keys()) | set(idx_b.keys()))
+
+    rows = []
+    for src in all_sources:
+        scores: dict[str, float] = {}
+        for cand_dict in (idx_a, idx_b):
+            for rank_0, tgt in enumerate(cand_dict.get(src, [])):
+                score = max(K - rank_0, 0)
+                scores[tgt] = scores.get(tgt, 0.0) + score
+        ranked = sorted(scores.keys(), key=lambda t: -scores[t])[:K]
+        rows.append({"source_account_id": src, "predict_target_account_id": ranked})
+    return pd.DataFrame(rows)
+
+
+def run_alignment(
+    source_file: str,
+    target_file: str,
+    need_align_file: str,
+    output_file: str,
+    K: int = 10,
+    ground_truth_file: Optional[str] = None,
+) -> tuple[str, dict]:
+    """
+    双维度（频率 + 风格）用户对齐，接口与 GNN run_alignment 统一。
+
+    Parameters
+    ----------
+    source_file       : 源平台消息 CSV 路径（或含多 CSV 的目录）
+    target_file       : 目标平台消息 CSV 路径
+    need_align_file   : 待对齐 source 账号列表 CSV（含 account_id 列）
+    output_file       : 结果输出 CSV 路径
+    K                 : Top-K 候选数量
+    ground_truth_file : 真值表 CSV 路径（可选）
+
+    Returns
+    -------
+    (output_file_path, metrics)
+      metrics 含 hit@1, hit@{K}, MRR；若无真值则为 {}
+    """
+    df_src = load_messages_from_path(source_file)
+    df_tgt = load_messages_from_path(target_file)
+    if df_src.empty or df_tgt.empty:
+        raise RuntimeError("source 或 target 消息为空，请检查路径与 CSV。")
+
+    need_align_accounts = _load_need_align_accounts(need_align_file)
+    df_src_filtered = df_src[df_src["account_id"].astype(str).isin(need_align_accounts)]
+    if df_src_filtered.empty:
+        raise RuntimeError(
+            "过滤后 source 消息为空，请检查 need_align_file 与 source_file 的 account_id 是否匹配。"
+        )
+
+    cand_freq = run_frequency_alignment(df_src_filtered, df_tgt, k=K)
+    cand_style = run_style_alignment(df_src_filtered, df_tgt, k=K)
+    cand_fused = _borda_fuse_candidates(cand_freq, cand_style, K=K)
+
+    # 写出 GNN 格式：source_account_id, predict_target_account_id（逗号分隔字符串）
+    os.makedirs(os.path.dirname(os.path.abspath(output_file)), exist_ok=True)
+    out_rows = []
+    for _, row in cand_fused.iterrows():
+        preds = row["predict_target_account_id"]
+        preds_str = ",".join(str(p) for p in preds) if isinstance(preds, list) else str(preds)
+        out_rows.append({"source_account_id": row["source_account_id"], "predict_target_account_id": preds_str})
+    pd.DataFrame(out_rows).to_csv(output_file, index=False, encoding="utf-8-sig")
+    print(f"[style] 已写入: {output_file}")
+
+    metrics: dict = {}
+    if ground_truth_file and os.path.isfile(ground_truth_file):
+        gt_df = load_ground_truth_align_accounts(ground_truth_file)
+        if gt_df is not None and not gt_df.empty:
+            metrics = compute_alignment_metrics(cand_fused, gt_df, k=K)
+            print("[style] 评估结果:")
+            for name, val in metrics.items():
+                print(f"  {name}: {val:.4f}" if isinstance(val, float) else f"  {name}: {val}")
+
+    return output_file, metrics
 
 
 def main() -> None:
