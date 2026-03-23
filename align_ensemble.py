@@ -74,6 +74,19 @@ def _get_runner_gnn():
     return mod.run_alignment
 
 
+def _get_runner_style():
+    """
+    加载 style/user_alignment.py 并返回 run_alignment 函数。
+    user_alignment.py 会自行把 style/ 目录加到 sys.path，
+    使得 align_common / align_frequency / align_style 可被正常 import。
+    """
+    mod = _load_module(
+        "user_alignment",
+        os.path.join(_PROJ_DIR, "style", "user_alignment.py"),
+    )
+    return mod.run_alignment
+
+
 def _get_runner_user_picture():
     """加载 user_picture/user_picture_align.py 并返回 run_alignment 函数。"""
     mod = _load_module(
@@ -251,6 +264,7 @@ def run_ensemble(
     output_file: str,
     K: int = 10,
     disable_gnn: bool = False,
+    disable_style: bool = False,
     disable_user_picture: bool = False,
     disable_topic: bool = False,
     source_profile_file: str = "",
@@ -259,7 +273,7 @@ def run_ensemble(
     topic_num_topics: int = 80,
 ) -> Tuple[str, Dict]:
     """
-    并行运行三种对齐方法 + Borda Count 投票融合，输出一个 CSV 文件。
+    并行运行四种对齐方法 + Borda Count 投票融合，输出一个 CSV 文件。
 
     Parameters
     ----------
@@ -270,6 +284,7 @@ def run_ensemble(
     output_file          : 融合结果输出 CSV 路径
     K                    : Top-K 候选数量
     disable_gnn          : 跳过 GNN 方法
+    disable_style        : 跳过 Style 方法
     disable_user_picture : 跳过 UserPicture 方法
     disable_topic        : 跳过 Topic 方法（需要 sentence_transformers + torch）
     source_profile_file  : 源平台用户画像 CSV（UserPicture 方法必需）
@@ -296,6 +311,7 @@ def run_ensemble(
     tmp_dir = tempfile.mkdtemp(prefix="align_ens_")
     tmp_paths = {
         "GNN":         os.path.join(tmp_dir, "gnn_result.csv"),
+        "Style":       os.path.join(tmp_dir, "style_result.csv"),
         "UserPicture": os.path.join(tmp_dir, "user_picture_result.csv"),
         "Topic":       os.path.join(tmp_dir, "topic_result.csv"),
     }
@@ -304,6 +320,8 @@ def run_ensemble(
     tasks: List[Tuple[str, callable, str, dict]] = []
     if not disable_gnn:
         tasks.append(("GNN",   _get_runner_gnn,   tmp_paths["GNN"],   {}))
+    if not disable_style:
+        tasks.append(("Style", _get_runner_style, tmp_paths["Style"], {}))
     if not disable_user_picture:
         if not source_profile_file or not target_profile_file:
             raise ValueError("启用 UserPicture 方法时必须指定 --source_profile_file 和 --target_profile_file")
@@ -318,7 +336,7 @@ def run_ensemble(
         ))
 
     if not tasks:
-        raise ValueError("至少需要启用一种对齐方法（GNN / UserPicture / Topic）。")
+        raise ValueError("至少需要启用一种对齐方法（GNN / Style / UserPicture / Topic）。")
 
     print(f"\n启用方法: {[t[0] for t in tasks]}")
 
@@ -491,6 +509,7 @@ def main() -> None:
 
     # 方法开关
     parser.add_argument("--disable_gnn",          action="store_true", help="跳过 GNN 方法")
+    parser.add_argument("--disable_style",        action="store_true", help="跳过 Style 方法")
     parser.add_argument("--disable_user_picture",  action="store_true", help="跳过 UserPicture 方法")
     parser.add_argument(
         "--disable_topic",
@@ -522,6 +541,7 @@ def main() -> None:
         output_file=args.output_file,
         K=args.k,
         disable_gnn=args.disable_gnn,
+        disable_style=args.disable_style,
         disable_user_picture=args.disable_user_picture,
         disable_topic=args.disable_topic,
         source_profile_file=args.source_profile_file,
